@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -108,22 +109,38 @@ def _ai_segment(raw_text: str, log_callback=None) -> list[dict]:
     """
     _log = log_callback or (lambda msg: None)
 
-    client = OpenAI(
-        api_key=config.LLM_API_KEY,
-        base_url=config.LLM_BASE_URL,
-    )
-
     # 文本太长时分块处理
     chunks = _split_text_chunks(raw_text, max_chars=8000)
     all_items = []
 
-    _log(f"文本已分为 {len(chunks)} 个块，开始AI解析...")
+    _log(f"文本已分为 {len(chunks)} 个块，开始AI并发解析...")
 
-    for i, chunk in enumerate(chunks):
-        _log(f"  解析第 {i+1}/{len(chunks)} 块 ({len(chunk)} 字符)...")
-        items = _segment_chunk(client, chunk, i + 1, len(chunks))
-        _log(f"  第 {i+1} 块识别出 {len(items)} 个条目")
-        all_items.extend(items)
+    client = OpenAI(
+        api_key=config.LLM_API_KEY,
+        base_url=config.LLM_BASE_URL,
+    )
+    total_chunks = len(chunks)
+
+    # 并发调用LLM解析每个块
+    chunk_results = [None] * total_chunks
+
+    def _parse_one(i, chunk):
+        items = _segment_chunk(client, chunk, i + 1, total_chunks)
+        return i, items
+
+    with ThreadPoolExecutor(max_workers=min(6, total_chunks)) as pool:
+        futures = {pool.submit(_parse_one, i, c): i for i, c in enumerate(chunks)}
+        done_count = 0
+        for future in as_completed(futures):
+            i, items = future.result()
+            chunk_results[i] = items
+            done_count += 1
+            _log(f"  块 {i+1} 完成: {len(items)} 条 ({done_count}/{total_chunks})")
+
+    all_items = []
+    for items in chunk_results:
+        if items:
+            all_items.extend(items)
 
     # 去重（同一个条目可能在分块边界重复出现）
     before_dedup = len(all_items)
@@ -168,13 +185,13 @@ def _segment_chunk(client: OpenAI, text_chunk: str, chunk_num: int, total_chunks
             model=config.LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=4000,
+            max_tokens=8000,
         )
 
         content = response.choices[0].message.content
         json_str = _extract_json_array(content)
         if json_str:
-            items = json.loads(json_str)
+            items = _safe_parse_json_array(json_str)
             # 验证格式
             valid_items = []
             for item in items:
@@ -240,7 +257,36 @@ def _extract_json_array(text: str) -> str | None:
     match = re.search(r'\[[\s\S]*\]', text)
     if match:
         return match.group(0)
+    # 可能被截断，只有 [ 开头没有 ] 结尾
+    match = re.search(r'\[[\s\S]*', text)
+    if match:
+        return match.group(0)
     return None
+
+
+def _safe_parse_json_array(json_str: str) -> list:
+    """解析JSON数组，支持截断修复"""
+    # 先尝试直接解析
+    try:
+        result = json.loads(json_str)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # 截断修复：逐步删减尾部，尝试闭合
+    # 找到最后一个完整的 }, 然后补 ]
+    for i in range(len(json_str) - 1, 0, -1):
+        if json_str[i] == '}':
+            attempt = json_str[:i+1] + ']'
+            try:
+                result = json.loads(attempt)
+                if isinstance(result, list):
+                    return result
+            except json.JSONDecodeError:
+                continue
+
+    return []
 
 
 def _deduplicate(items: list[dict]) -> list[dict]:

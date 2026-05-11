@@ -149,31 +149,45 @@ def match_all_items(
         _log(f"  ❌ 批量向量检索失败: {e}，退回逐条模式")
         all_candidates = None
 
-    # === Phase 2: 逐条LLM精排 ===
-    _log(f"Phase 2/2: LLM精排 + 置信度计算...")
-    results = []
+    # === Phase 2: 并发LLM精排 ===
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
 
-    for i, item in enumerate(enquiry_items):
-        t1 = time.time()
-        title_short = item.get("title", "")[:40]
-        _log(f"  [{i+1}/{total}] {title_short}...")
+    max_workers = 8
+    _log(f"Phase 2/2: LLM并发精排 (并发={max_workers})...")
 
-        if all_candidates is not None:
-            candidates = all_candidates[i]
-            result = _match_with_candidates(item, candidates)
+    results = [None] * total
+    done_count = 0
+    lock = threading.Lock()
+    t_phase2 = time.time()
+
+    def _do_match(i, item, candidates):
+        if candidates is not None:
+            return i, _match_with_candidates(item, candidates)
         else:
-            result = match_single_item(item, index, craft_items)
+            return i, match_single_item(item, index, craft_items)
 
-        elapsed = time.time() - t1
-        conf = result.get("confidence", 0)
-        status = "新增" if result.get("is_new_item") else f"置信度={conf}"
-        _log(f"    → {status} ({elapsed:.1f}s)")
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {}
+        for i, item in enumerate(enquiry_items):
+            cands = all_candidates[i] if all_candidates is not None else None
+            fut = pool.submit(_do_match, i, item, cands)
+            futures[fut] = i
 
-        results.append(result)
+        for fut in as_completed(futures):
+            i, result = fut.result()
+            results[i] = result
+            with lock:
+                done_count += 1
+                cnt = done_count
+            conf = result.get("confidence", 0)
+            status = "新增" if result.get("is_new_item") else f"置信度={conf}"
+            title_short = enquiry_items[i].get("title", "")[:40]
+            _log(f"  [{cnt}/{total}] {title_short} → {status}")
+            if progress_callback:
+                progress_callback(cnt, total)
 
-        if progress_callback:
-            progress_callback(i + 1, total)
-
+    _log(f"  并发精排完成，耗时 {time.time()-t_phase2:.1f}s")
     return results
 
 

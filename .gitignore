@@ -1,0 +1,47 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# 环境变量 - 含API密钥
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# 测试文件
+test_*.pdf
+test_*.xlsx
+test_*.json
+test_*.xls
+_last_results.json
+test_history.json
+test_report.json
+
+# 临时输出
+*.tmp
+temp/
+tmp/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# 截图和文档 (非代码)
+*.png
+*.jpg
+*.jpeg
+*.md
+!CLAUDE.md
+!README.md
+
+# 二进制索引文件
+data/*.index

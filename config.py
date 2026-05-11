@@ -2,9 +2,16 @@
 配置文件 - API密钥和模型参数
 """
 import os
+try:
+    from dotenv import load_dotenv
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
+except ImportError:
+    pass  # dotenv not installed. use system env vars or defaults.
 
 # === LLM API 配置 ===
-LLM_API_KEY = os.getenv("LLM_API_KEY", "sk-c4c68e444f5f43fe918759f998d35884")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen-plus")
 
