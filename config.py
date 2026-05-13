@@ -81,6 +81,8 @@ QUOTATION_STORE_DIR = os.getenv(
     os.path.join(_PROJECT_ROOT, "data", "quotations"),
 )
 QUOTATION_STORE_MAX_RECORDS = int(os.getenv("QUOTATION_STORE_MAX_RECORDS", "500"))
+# 侧栏「当前报价员」留空时写入「我的报价」的归属（公开演示共用一桶；可用环境变量改名）
+QUOTATION_OWNER_FALLBACK = os.getenv("QUOTATION_OWNER_FALLBACK", "演示访客").strip() or "演示访客"
 
 # === 解析召回优先（宁可多不可少） ===
 PARSE_CHUNK_MAX_CHARS = int(os.getenv("PARSE_CHUNK_MAX_CHARS", "12000"))

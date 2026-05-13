@@ -124,6 +124,20 @@ def load_run(run_id: str) -> dict | None:
         return None
 
 
+def save_run_match_snapshot(run_id: str, match_results: list[dict]) -> bool:
+    """将当前匹配结果写入对应 run 文件，供「历史解析」展示报价单快照。"""
+    rid = (run_id or "").strip()
+    if not rid:
+        return False
+    rec = load_run(rid)
+    if not rec:
+        return False
+    rec["match_results"] = list(match_results or [])
+    rec["match_snapshot_at"] = datetime.now(timezone.utc).isoformat()
+    _atomic_write_json(_run_file(rid), rec)
+    return True
+
+
 def clear_all_runs() -> int:
     """删除目录下所有 run 文件与索引。返回删除的 run 文件数。"""
     d = _runs_dir()
