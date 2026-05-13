@@ -53,10 +53,20 @@ CONFIDENCE_LEVELS = {
 
 # === 文件路径 ===
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-CRAFT_LIBRARY_PATH = os.getenv(
-    "CRAFT_LIBRARY_PATH",
-    r"C:\Users\24895\Desktop\万邦船舶询价\万邦提供的报价单模板.xlsx"
-)
+_REPO_CRAFT_TEMPLATE = os.path.join(_PROJECT_ROOT, "data", "craft_template.xlsx")
+_LEGACY_CRAFT_TEMPLATE = r"C:\Users\24895\Desktop\万邦船舶询价\万邦提供的报价单模板.xlsx"
+
+
+def _default_craft_library_path() -> str:
+    """优先仓库内模板（GitHub/Streamlit），否则回退本机历史路径。"""
+    if os.path.isfile(_REPO_CRAFT_TEMPLATE):
+        return _REPO_CRAFT_TEMPLATE
+    if os.path.isfile(_LEGACY_CRAFT_TEMPLATE):
+        return _LEGACY_CRAFT_TEMPLATE
+    return _REPO_CRAFT_TEMPLATE
+
+
+CRAFT_LIBRARY_PATH = os.getenv("CRAFT_LIBRARY_PATH", "").strip() or _default_craft_library_path()
 
 # 询价解析历史（Streamlit「历史解析」Tab，仅 JSON，不含原文件二进制）
 ENQUIRY_HISTORY_DIR = os.getenv(
@@ -64,6 +74,13 @@ ENQUIRY_HISTORY_DIR = os.getenv(
     os.path.join(_PROJECT_ROOT, "data", "enquiry_runs"),
 )
 ENQUIRY_HISTORY_MAX_RUNS = int(os.getenv("ENQUIRY_HISTORY_MAX_RUNS", "200"))
+
+# 报价单归档（「我的报价」Tab，含匹配快照与可选 Excel 副本）
+QUOTATION_STORE_DIR = os.getenv(
+    "QUOTATION_STORE_DIR",
+    os.path.join(_PROJECT_ROOT, "data", "quotations"),
+)
+QUOTATION_STORE_MAX_RECORDS = int(os.getenv("QUOTATION_STORE_MAX_RECORDS", "500"))
 
 # === 解析召回优先（宁可多不可少） ===
 PARSE_CHUNK_MAX_CHARS = int(os.getenv("PARSE_CHUNK_MAX_CHARS", "12000"))
