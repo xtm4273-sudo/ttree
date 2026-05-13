@@ -1261,6 +1261,10 @@ if config_errors:
 # 初始化 session state
 init_session_state()
 
+# 侧栏须先于主区「在此处构建索引」执行：同一次 rerun 内才能把侧栏 API Key 写回 config；
+# 否则主区按钮会用 import 时的旧值（易与 Secrets/侧栏不一致，表现为 401）。
+index, craft_items = render_sidebar()
+
 if st.session_state.get("index") is None:
     with st.expander("**首次部署**：找不到侧栏时，请在此构建工艺库索引", expanded=True):
         st.caption(
@@ -1280,9 +1284,6 @@ if st.session_state.get("index") is None:
                     st.rerun()
                 else:
                     st.error(f"构建失败：{err}")
-
-# 侧边栏
-index, craft_items = render_sidebar()
 
 tab_upload, tab_my_quotations, tab_history = st.tabs(["上传处理", "我的报价", "历史解析"])
 
