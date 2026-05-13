@@ -1,0 +1,31 @@
+{
+  "source_pdf": "C:/Users/24895/Desktop/万邦船舶询价/询价单.pdf",
+  "sample_pdf": "benchmark_outputs\\sample_contiguous_50p_20260512_160921.pdf",
+  "sample_meta": {
+    "total_pages": 300,
+    "sample_pages": 50,
+    "start_page_1based": 166,
+    "end_page_1based": 215
+  },
+  "output_excel": "benchmark_outputs\\quotation_sample_50p_20260512_160921.xlsx",
+  "timings_sec": {
+    "parse": 367.51,
+    "match": 29.08,
+    "excel": 0.05,
+    "total": 396.85
+  },
+  "result_stats": {
+    "total_items": 48,
+    "high_confidence": 35,
+    "medium_confidence": 8,
+    "low_confidence": 5,
+    "new_items": 0,
+    "llm_called_items": 24,
+    "llm_called_ratio": 0.5,
+    "decision_path_counts": {
+      "llm_rerank": 24,
+      "direct_sfi": 22,
+      "vector_only": 2
+    }
+  }
+}

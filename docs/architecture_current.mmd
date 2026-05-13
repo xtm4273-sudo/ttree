@@ -1,0 +1,57 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#E8F4FC', 'primaryTextColor': '#1a1a1a', 'primaryBorderColor': '#2563eb', 'lineColor': '#64748b', 'secondaryColor': '#F1F5F9', 'tertiaryColor': '#fff'}}}%%
+flowchart TB
+    subgraph USER["用户层"]
+        U["Streamlit 浏览器界面"]
+    end
+
+    subgraph IN["输入与抽取"]
+        F["上传 PDF / Word / Excel"]
+        E1["PDF: 正文 + 表格"]
+        E2["Word / Excel: 文本与表"]
+        F --> E1
+        F --> E2
+    end
+
+    subgraph PARSE["解析层"]
+        R["规则优先识别条目"]
+        L["LLM 分段补缺"]
+        H["层级与质量打标"]
+        E1 --> R
+        E2 --> R
+        R --> L
+        R --> H
+        L --> H
+    end
+
+    subgraph OFF["工艺库离线"]
+        X["标准报价模板 Excel"]
+        B["工艺条目结构化"]
+        V["Embedding 向量化"]
+        IDX[("FAISS 索引")]
+        X --> B --> V --> IDX
+    end
+
+    subgraph MATCH["在线匹配"]
+        Q["构建检索查询"]
+        BE["批量 Embedding"]
+        S["FAISS Top-K 检索"]
+        G{"门控: 直通 / 阈值 / 分差"}
+        LR["LLM 精排 并发"]
+        C["置信度融合"]
+        SF["降权与人工复核标记"]
+        H --> Q
+        Q --> BE --> S --> G
+        G -->|需复核| LR
+        G -->|高置信| C
+        LR --> C
+        C --> SF
+        IDX -.-> S
+    end
+
+    subgraph OUT["输出"]
+        O["Excel 报价单多 Sheet"]
+        SF --> O
+    end
+
+    U --> F
+    U --> O

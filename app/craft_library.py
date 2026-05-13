@@ -5,12 +5,80 @@ import json
 import os
 import re
 import numpy as np
+import faiss
 from openpyxl import load_workbook
-from openai import OpenAI
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from app.llm_client import get_embed_client
+
+
+def craft_entry_dedupe_key(item: dict) -> tuple[str, str]:
+    """用于模板行与用户增量行的去重（SFI 大写 + 标题去首尾空格）。"""
+    sfi = (item.get("sfi_code") or "").strip().upper()
+    title = (item.get("title") or "").strip()
+    return (sfi, title)
+
+
+def ensure_craft_full_text(item: dict) -> None:
+    """与 load_craft_library 一致：编码 + 标题 + 可选 detail，用 ' - ' 拼接。"""
+    parts = [item.get("sfi_code") or "", item.get("title") or ""]
+    detail = (item.get("detail") or "").strip()
+    if detail:
+        parts.append(detail)
+    item["full_text"] = " - ".join(parts).strip() or (item.get("title") or "").strip()
+
+
+def load_user_added_entries_from_disk(data_dir: str = "data") -> list[dict]:
+    """从 craft_library.json 读出 source=user_added 的条目（不含 id，供合并）。"""
+    data_path = os.path.join(data_dir, "craft_library.json")
+    if not os.path.isfile(data_path):
+        return []
+    with open(data_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    out: list[dict] = []
+    for it in data:
+        if it.get("source") != "user_added":
+            continue
+        title = (it.get("title") or "").strip()
+        if not title:
+            continue
+        out.append(
+            {
+                "sfi_code": it.get("sfi_code") or "",
+                "title": title,
+                "detail": it.get("detail") or "",
+                "unit": it.get("unit") or "LOT",
+                "qty_template": it.get("qty_template"),
+                "category": it.get("category") or "",
+                "source": "user_added",
+            }
+        )
+    return out
+
+
+def merge_template_with_saved_user_entries(
+    template_items: list[dict], data_dir: str = "data"
+) -> list[dict]:
+    """
+    将模板 Excel 解析结果与磁盘上已保存的 user_added 条目合并（去重后模板在前），
+    并重赋 id、统一 full_text。用于「从模板重建索引」时不丢失学习条目。
+    """
+    seen: set[tuple[str, str]] = {craft_entry_dedupe_key(x) for x in template_items}
+    merged: list[dict] = [dict(x) for x in template_items]
+    for u in load_user_added_entries_from_disk(data_dir):
+        k = craft_entry_dedupe_key(u)
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(dict(u))
+    for i, it in enumerate(merged):
+        it["id"] = i
+        if it.get("source") != "user_added":
+            it["source"] = "template"
+        ensure_craft_full_text(it)
+    return merged
 
 
 def load_craft_library(excel_path: str = None) -> list[dict]:
@@ -83,10 +151,8 @@ def load_craft_library(excel_path: str = None) -> list[dict]:
     # 生成完整文本（用于embedding）和ID
     for i, item in enumerate(items):
         item["id"] = i
-        parts = [item["sfi_code"], item["title"]]
-        if item["detail"]:
-            parts.append(item["detail"])
-        item["full_text"] = " - ".join(parts)
+        item["source"] = "template"
+        ensure_craft_full_text(item)
 
     return items
 
@@ -96,10 +162,7 @@ def get_embeddings(texts: list[str], batch_size: int = 6) -> np.ndarray:
     调用Embedding API获取文本向量。
     支持OpenAI兼容接口。
     """
-    client = OpenAI(
-        api_key=config.EMBED_API_KEY,
-        base_url=config.EMBED_BASE_URL,
-    )
+    client = get_embed_client()
 
     all_embeddings = []
     for i in range(0, len(texts), batch_size):
@@ -118,8 +181,6 @@ def build_vector_index(craft_items: list[dict], save_dir: str = "data"):
     """
     为工艺库构建FAISS向量索引。
     """
-    import faiss
-
     os.makedirs(save_dir, exist_ok=True)
 
     texts = [item["full_text"] for item in craft_items]
@@ -152,8 +213,6 @@ def build_vector_index(craft_items: list[dict], save_dir: str = "data"):
 
 def load_vector_index(data_dir: str = "data"):
     """加载已保存的向量索引和工艺库数据"""
-    import faiss
-
     index_path = os.path.join(data_dir, "craft_library.index")
     data_path = os.path.join(data_dir, "craft_library.json")
 
@@ -171,8 +230,6 @@ def search_similar(query_text: str, index, craft_items: list[dict], top_k: int =
     """
     向量检索：找到与query最相似的top-K条工艺。
     """
-    import faiss
-
     k = top_k or config.TOP_K
 
     query_emb = get_embeddings([query_text])
@@ -197,8 +254,6 @@ def batch_search_similar(query_texts: list[str], index, craft_items: list[dict],
     批量向量检索：一次API调用获取所有embedding，再批量FAISS检索。
     比逐条调用 search_similar 快 N 倍。
     """
-    import faiss
-
     k = top_k or config.TOP_K
     query_embs = get_embeddings(query_texts)
     faiss.normalize_L2(query_embs)
@@ -220,7 +275,7 @@ def batch_search_similar(query_texts: list[str], index, craft_items: list[dict],
     return all_results
 
 
-def add_to_library(new_entry: dict, data_dir: str = "data") -> bool:
+def add_to_library(new_entry: dict, data_dir: str = "data") -> tuple[bool, int | None]:
     """
     增量更新：将人工确认的新条目加入工艺库。
     （学习进化机制的核心）
@@ -235,36 +290,43 @@ def add_to_library(new_entry: dict, data_dir: str = "data") -> bool:
         data_dir: 数据目录
 
     Returns:
-        是否成功
+        (是否成功, 新条目 craft id)；失败时为 (False, None)。
     """
-    import faiss
-
     index_path = os.path.join(data_dir, "craft_library.index")
     data_path = os.path.join(data_dir, "craft_library.json")
 
     if not os.path.exists(index_path) or not os.path.exists(data_path):
-        return False
+        return False, None
 
+    title = (new_entry.get("title") or "").strip()
+    if not title:
+        return False, None
+
+    probe = {"sfi_code": new_entry.get("sfi_code") or "", "title": title}
     # 加载现有数据
     index = faiss.read_index(index_path)
     with open(data_path, "r", encoding="utf-8") as f:
         craft_items = json.load(f)
 
-    # 构建新条目
-    new_id = len(craft_items)
-    full_text = f"{new_entry.get('sfi_code', '')} {new_entry['title']} - {new_entry.get('description', '')}".strip()
+    nk = craft_entry_dedupe_key(probe)
+    for it in craft_items:
+        if craft_entry_dedupe_key(it) == nk:
+            print(f"[工艺库更新] 跳过重复: SFI={probe['sfi_code']!r} title={title[:40]!r}")
+            return False, None
 
+    new_id = len(craft_items)
     new_item = {
         "id": new_id,
-        "sfi_code": new_entry.get("sfi_code", ""),
-        "title": new_entry["title"],
-        "detail": new_entry.get("description", ""),
-        "unit": new_entry.get("unit", "LOT"),
+        "sfi_code": new_entry.get("sfi_code") or "",
+        "title": title,
+        "detail": (new_entry.get("description") or "").strip(),
+        "unit": (new_entry.get("unit") or "LOT") or "LOT",
         "qty_template": None,
         "category": "",
-        "full_text": full_text,
-        "source": "user_added",  # 标记来源
+        "source": "user_added",
     }
+    ensure_craft_full_text(new_item)
+    full_text = new_item["full_text"]
 
     # 向量化新条目
     new_emb = get_embeddings([full_text])
@@ -279,5 +341,74 @@ def add_to_library(new_entry: dict, data_dir: str = "data") -> bool:
     with open(data_path, "w", encoding="utf-8") as f:
         json.dump(craft_items, f, ensure_ascii=False, indent=2)
 
-    print(f"[工艺库更新] 新增条目 #{new_id}: {new_entry['title']}")
-    return True
+    print(f"[工艺库更新] 新增条目 #{new_id}: {title}")
+    return True, new_id
+
+
+def batch_add_to_library(
+    entries: list[dict], data_dir: str = "data"
+) -> tuple[int, list[str], list[dict]]:
+    """
+    批量入库（单次 embedding 批量调用）。每条 entry 同 add_to_library 字段。
+    返回 (成功条数, 错误/跳过说明列表, 成功写入条目的摘要列表 craft_id/title/sfi_code)。
+    """
+    index_path = os.path.join(data_dir, "craft_library.index")
+    data_path = os.path.join(data_dir, "craft_library.json")
+    errors: list[str] = []
+    if not os.path.exists(index_path) or not os.path.exists(data_path):
+        return 0, ["索引或 craft_library.json 不存在"], []
+
+    index = faiss.read_index(index_path)
+    with open(data_path, "r", encoding="utf-8") as f:
+        craft_items = json.load(f)
+
+    existing_keys = {craft_entry_dedupe_key(it) for it in craft_items}
+    pending: list[dict] = []
+    seen_batch: set[tuple[str, str]] = set()
+
+    for idx, raw in enumerate(entries):
+        title = (raw.get("title") or "").strip()
+        if not title:
+            errors.append(f"第{idx + 1}条: 缺少标题")
+            continue
+        item = {
+            "sfi_code": (raw.get("sfi_code") or "").strip(),
+            "title": title,
+            "detail": (raw.get("description") or raw.get("detail") or "").strip(),
+            "unit": (raw.get("unit") or "LOT") or "LOT",
+            "qty_template": None,
+            "category": "",
+            "source": "user_added",
+        }
+        k = craft_entry_dedupe_key(item)
+        if k in existing_keys or k in seen_batch:
+            errors.append(f"第{idx + 1}条: 与库内或本批重复 ({k[0]!r}, {k[1][:30]!r})")
+            continue
+        seen_batch.add(k)
+        existing_keys.add(k)
+        pending.append(item)
+
+    if not pending:
+        return 0, errors, []
+
+    start_id = len(craft_items)
+    for j, it in enumerate(pending):
+        it["id"] = start_id + j
+        ensure_craft_full_text(it)
+
+    texts = [it["full_text"] for it in pending]
+    embs = get_embeddings(texts)
+    faiss.normalize_L2(embs)
+    index.add(embs)
+    craft_items.extend(pending)
+
+    faiss.write_index(index, index_path)
+    with open(data_path, "w", encoding="utf-8") as f:
+        json.dump(craft_items, f, ensure_ascii=False, indent=2)
+
+    print(f"[工艺库更新] 批量新增 {len(pending)} 条")
+    added_meta = [
+        {"craft_id": it["id"], "craft_title": it.get("title", ""), "craft_sfi": it.get("sfi_code") or ""}
+        for it in pending
+    ]
+    return len(pending), errors, added_meta

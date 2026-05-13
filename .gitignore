@@ -35,6 +35,9 @@ tmp/
 Thumbs.db
 .DS_Store
 
+# Office 临时锁文件
+~$*
+
 # 截图和文档 (非代码)
 *.png
 *.jpg
@@ -45,3 +48,9 @@ Thumbs.db
 
 # 二进制索引文件
 data/*.index
+
+# 询价解析历史（可能含客户数据）
+data/enquiry_runs/
+
+# 学习入库审计（本地追溯，可能含业务字段）
+data/learn_history.jsonl

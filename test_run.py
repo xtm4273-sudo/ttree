@@ -65,13 +65,15 @@ def main():
     med = sum(1 for r in results if 60 <= r["confidence"] < 80 and not r.get("is_new_item"))
     low = sum(1 for r in results if 40 <= r["confidence"] < 60 and not r.get("is_new_item"))
     new_items = sum(1 for r in results if r.get("is_new_item"))
+    pending = sum(1 for r in results if r.get("review_status") == "PENDING_REVIEW")
 
     log("=== 匹配统计 ===")
     log(f"  总条目: {total}")
     log(f"  高置信(>=80): {high} ({high*100//max(total,1)}%)")
     log(f"  中等(60-79):  {med} ({med*100//max(total,1)}%)")
     log(f"  低(40-59):    {low} ({low*100//max(total,1)}%)")
-    log(f"  新增项(<40):  {new_items} ({new_items*100//max(total,1)}%)")
+    log(f"  库无向量候选: {new_items} ({new_items*100//max(total,1)}%)")
+    log(f"  待人工(PENDING): {pending} ({pending*100//max(total,1)}%)")
 
     # 打印部分匹配结果
     log("=== 匹配结果示例 ===")

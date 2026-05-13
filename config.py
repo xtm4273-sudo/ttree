@@ -23,10 +23,24 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-v3")
 # === 匹配参数 ===
 TOP_K = 10  # 向量检索返回候选数
 
+# 匹配阶段审计：每条匹配追加一行 JSON（含是否调用大模型精排、门控原因、向量 Top1/2 等）
+# 设为非空路径则启用，例如 MATCH_LLM_AUDIT_JSONL=logs/match_llm_audit.jsonl
+MATCH_LLM_AUDIT_JSONL = os.getenv("MATCH_LLM_AUDIT_JSONL", "").strip()
+
+# === 策略开关（准确度优先，减少冗余LLM调用） ===
+ENABLE_RULE_FIRST = True
+ENABLE_LLM_RERANK = True
+ENABLE_AUTO_SUGGEST_NEW_ENTRY = False
+
+# LLM精排触发门槛（仅在不确定时触发）
+LLM_RERANK_TOP1_MIN = 70
+LLM_RERANK_GAP_MAX = 5
+LLM_RERANK_VECTOR_MIN = 72
+
 CONFIDENCE_WEIGHTS = {
-    "vector_similarity": 0.25,  # 向量相似度权重
-    "llm_score": 0.55,          # LLM打分权重
-    "sfi_match": 0.20,          # SFI编码匹配权重（无编码时自动归零）
+    "vector_similarity": 0.40,  # 向量相似度权重
+    "llm_score": 0.35,          # LLM打分权重
+    "sfi_match": 0.25,          # SFI编码匹配权重（无编码时自动归零）
 }
 
 # === 置信度分级阈值 ===
@@ -38,7 +52,22 @@ CONFIDENCE_LEVELS = {
 }
 
 # === 文件路径 ===
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 CRAFT_LIBRARY_PATH = os.getenv(
     "CRAFT_LIBRARY_PATH",
     r"C:\Users\24895\Desktop\万邦船舶询价\万邦提供的报价单模板.xlsx"
 )
+
+# 询价解析历史（Streamlit「历史解析」Tab，仅 JSON，不含原文件二进制）
+ENQUIRY_HISTORY_DIR = os.getenv(
+    "ENQUIRY_HISTORY_DIR",
+    os.path.join(_PROJECT_ROOT, "data", "enquiry_runs"),
+)
+ENQUIRY_HISTORY_MAX_RUNS = int(os.getenv("ENQUIRY_HISTORY_MAX_RUNS", "200"))
+
+# === 解析召回优先（宁可多不可少） ===
+PARSE_CHUNK_MAX_CHARS = int(os.getenv("PARSE_CHUNK_MAX_CHARS", "12000"))
+PARSE_CHUNK_FALLBACK_CHARS = int(os.getenv("PARSE_CHUNK_FALLBACK_CHARS", "6000"))
+PARSE_MAX_TOKENS = int(os.getenv("PARSE_MAX_TOKENS", "12000"))
+# 单块疑似截断或条目过少时，按更小子块重试
+PARSE_MIN_ITEMS_PER_CHUNK_HEURISTIC = int(os.getenv("PARSE_MIN_ITEMS_PER_CHUNK_HEURISTIC", "1"))
