@@ -101,6 +101,118 @@ class JobProgress:
         self._show(1.0, "匹配已完成，请在下方核对预览后导出 Excel。")
 
 
+QUOTATION_PIPELINE_STEPS = (
+    "上传询价",
+    "解析项目",
+    "工艺匹配",
+    "核对报价",
+    "导出 Excel",
+)
+
+
+def derive_quotation_pipeline_step_states(file_key: str | None) -> list[str]:
+    """
+    五步主链每步 UI 状态：done / current / upcoming（不包含自主学习）。
+    """
+    n = len(QUOTATION_PIPELINE_STEPS)
+    if not file_key:
+        return ["upcoming"] * n
+
+    up = "upcoming"
+    cur = "current"
+    done = "done"
+
+    def pack(i_active: int) -> list[str]:
+        return [done if j < i_active else (cur if j == i_active else up) for j in range(n)]
+
+    fk = file_key
+    enquiry_items = st.session_state.get("enquiry_items")
+    if not isinstance(enquiry_items, list):
+        enquiry_items = []
+    mr = st.session_state.get("match_results")
+    mrfk = st.session_state.get("match_results_file_key")
+    matched = isinstance(mr, list) and mrfk == fk
+
+    if len(enquiry_items) == 0:
+        if not matched:
+            return pack(1)
+        # 解析结果为零条但已跑完匹配：仍进入核对/导出阶段
+    elif not matched:
+        return pack(2)
+
+    excel_ready = bool(st.session_state.get("excel_ready"))
+    excel_path = st.session_state.get("excel_path") or ""
+    path_ok = bool(excel_path) and os.path.isfile(excel_path)
+    rev = int(st.session_state.get("results_revision", 0))
+    export_rev = st.session_state.get("quotation_export_revision")
+    export_matches_rev = export_rev is None or int(export_rev) == rev
+    export_ok = excel_ready and path_ok and export_matches_rev
+
+    if export_ok:
+        return [done] * n
+
+    if excel_ready and path_ok and not export_matches_rev:
+        return pack(4)
+
+    return pack(3)
+
+
+def _quotation_pipeline_stepper_html(states: list[str]) -> str:
+    titles = QUOTATION_PIPELINE_STEPS
+    if len(states) != len(titles):
+        states = (list(states) + ["upcoming"] * len(titles))[: len(titles)]
+
+    def circle_inner(i: int, st: str) -> str:
+        if st == "done":
+            return "✓"
+        return str(i + 1)
+
+    def circle_class(st: str) -> str:
+        if st == "done":
+            return "ps-circle ps-done"
+        if st == "current":
+            return "ps-circle ps-current"
+        return "ps-circle ps-wait"
+
+    def title_class(st: str) -> str:
+        if st == "done":
+            return "ps-title ps-title-done"
+        if st == "current":
+            return "ps-title ps-title-current"
+        return "ps-title ps-title-wait"
+
+    parts: list[str] = ['<div class="pipeline-stepper"><div class="ps-row">']
+    for i, (title, st) in enumerate(zip(titles, states, strict=True)):
+        inner = circle_inner(i, st)
+        parts.append('<div class="ps-node">')
+        parts.append(f'<div class="{circle_class(st)}">{inner}</div>')
+        parts.append(f'<div class="{title_class(st)}">{title}</div>')
+        parts.append("</div>")
+        if i < len(titles) - 1:
+            line_done = states[i] == "done"
+            ln = "ps-line ps-line-done" if line_done else "ps-line"
+            parts.append(f'<div class="{ln}" aria-hidden="true"></div>')
+    parts.append("</div></div>")
+    return "".join(parts)
+
+
+def render_quotation_pipeline_stepper(file_key: str | None):
+    if not file_key:
+        return
+    states = derive_quotation_pipeline_step_states(file_key)
+    st.markdown(_quotation_pipeline_stepper_html(states), unsafe_allow_html=True)
+    rev = int(st.session_state.get("results_revision", 0))
+    er = st.session_state.get("quotation_export_revision")
+    if (
+        er is not None
+        and int(er) != rev
+        and st.session_state.get("excel_ready")
+        and st.session_state.get("excel_path")
+        and os.path.isfile(st.session_state["excel_path"])
+    ):
+        st.caption("报价表已相对上次导出发生变更，建议重新点击「导出 Excel 报价单」。")
+
+
 def init_session_state():
     """初始化 session state 中的索引和工艺库数据"""
     if "index_loaded" not in st.session_state:
@@ -266,7 +378,13 @@ def run_matching_pipeline(
         st.session_state["match_results"] = match_results
         st.session_state["match_results_file_key"] = file_key
         st.session_state["results_revision"] = st.session_state.get("results_revision", 0) + 1
-        for k in ("excel_ready", "excel_path", "excel_name", "quotation_preview_stamp"):
+        for k in (
+            "excel_ready",
+            "excel_path",
+            "excel_name",
+            "quotation_preview_stamp",
+            "quotation_export_revision",
+        ):
             st.session_state.pop(k, None)
         if job_progress:
             job_progress.after_match(len(enquiry_items))
@@ -294,7 +412,7 @@ def render_quotation_preview_and_export(active_file_key: str | None):
     if st.session_state.get("quotation_preview_stamp") != stamp:
         st.session_state["quotation_preview_stamp"] = stamp
         st.session_state["quotation_edited_df"] = match_results_to_preview_dataframe(results)
-        for k in ("excel_ready", "excel_path", "excel_name"):
+        for k in ("excel_ready", "excel_path", "excel_name", "quotation_export_revision"):
             st.session_state.pop(k, None)
 
     from streamlit.column_config import TextColumn
@@ -333,6 +451,7 @@ def render_quotation_preview_and_export(active_file_key: str | None):
         st.session_state["excel_ready"] = True
         st.session_state["excel_path"] = output_path
         st.session_state["excel_name"] = output_name
+        st.session_state["quotation_export_revision"] = int(st.session_state.get("results_revision", 0))
         st.session_state["quotation_edited_df"] = match_results_to_preview_dataframe(merged)
         st.success("已根据当前表格生成 Excel，可下载。")
         st.rerun()
@@ -415,15 +534,37 @@ def learning_bucket(res: dict) -> tuple[str, str]:
     return ("review_other", "建议人工核对")
 
 
-def render_self_learning_panel():
+def count_self_learning_eligible_rows() -> int:
+    """与自主学习面板相同的「可关注」条目数，用于可选分支标题提示。"""
+    md = st.session_state.get("match_results") or []
+    eq = st.session_state.get("enquiry_items") or []
+    if not md or not eq:
+        return 0
+    n = min(len(md), len(eq))
+    c = 0
+    for i in range(n):
+        res = md[i]
+        if (
+            res.get("is_new_item")
+            or res.get("needs_human_review")
+            or res.get("decision_path") == "no_candidate"
+        ):
+            c += 1
+    return c
+
+
+def render_self_learning_panel(embedded: bool = False):
     """无匹配/待确认等条目：按类别分组展示，人工确认后可写入工艺库并重匹配。"""
     md = st.session_state.get("match_results") or []
     eq = st.session_state.get("enquiry_items") or []
     if not md or not eq:
+        if embedded:
+            st.caption("暂无匹配结果；完成上方解析与匹配后，如需补录工艺可再展开此处。")
         return
     n = min(len(md), len(eq))
-    st.divider()
-    st.subheader("工艺库自主学习（人机闭环）")
+    if not embedded:
+        st.divider()
+        st.subheader("工艺库自主学习（人机闭环）")
     st.caption(
         "下方按**类别**列出需要关注的条目：**库无向量候选**表示工艺库里搜不到相近项；"
         "**待确认**表示有候选但置信低、前两名太接近或解析层级有风险等，请按公司主数据填写工艺标题与 SFI 后入库。"
@@ -590,6 +731,7 @@ def render_self_learning_panel():
                                     "excel_path",
                                     "excel_name",
                                     "quotation_preview_stamp",
+                                    "quotation_export_revision",
                                 ):
                                     st.session_state.pop(k, None)
                                 st.success(
@@ -907,6 +1049,7 @@ with tab_history:
                     "excel_name",
                     "quotation_preview_stamp",
                     "quotation_edited_df",
+                    "quotation_export_revision",
                 ]:
                     st.session_state.pop(key, None)
                 st.rerun()
@@ -930,6 +1073,7 @@ if uploaded_file:
             "excel_name",
             "quotation_preview_stamp",
             "quotation_edited_df",
+            "quotation_export_revision",
         ]:
             st.session_state.pop(key, None)
 
