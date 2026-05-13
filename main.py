@@ -4,7 +4,6 @@
 """
 import os
 import sys
-import json
 import tempfile
 import hashlib
 from collections import defaultdict
@@ -54,10 +53,22 @@ from app.excel_generator import (
     match_results_to_preview_dataframe,
     merge_preview_dataframe_into_match_results,
 )
-from app.enquiry_history import append_run, clear_all_runs, list_runs, load_run
+from app.enquiry_history import (
+    append_run,
+    clear_all_runs,
+    list_runs,
+    load_run,
+    save_run_match_snapshot,
+)
+from app import quotation_store
 import config
 
 # === 辅助函数 ===
+
+
+def _effective_quotation_owner() -> str:
+    """侧栏填写优先，否则用 config 中的演示默认归属（非空，满足持久层校验）。"""
+    return (st.session_state.get("quotation_owner_input") or "").strip() or config.QUOTATION_OWNER_FALLBACK
 
 
 class JobProgress:
@@ -251,9 +262,36 @@ def refresh_vector_index_session():
     st.session_state["craft_items"] = craft_items
 
 
+def run_build_vector_index(craft_lib_path: str) -> tuple[bool, str]:
+    """构建 data/craft_library.index 并刷新 session。返回 (成功, 错误说明)。"""
+    if not (config.LLM_API_KEY or "").strip():
+        return False, "请先配置 API Key（Streamlit Secrets 的 LLM_API_KEY 或侧栏输入框）。"
+    try:
+        template_only = load_craft_library(craft_lib_path)
+        craft_items = merge_template_with_saved_user_entries(template_only, "data")
+        build_vector_index(craft_items, "data")
+        refresh_vector_index_session()
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 def render_sidebar():
     """渲染侧边栏配置，返回 (index, craft_items)"""
     with st.sidebar:
+        st.markdown("### 当前报价员")
+        st.text_input(
+            "工号或姓名",
+            key="quotation_owner_input",
+            placeholder="用于「我的报价」归属",
+            help="MVP 不做登录；此处自填即可区分不同人的报价单列表。",
+        )
+        st.caption(
+            "留空时归档归属为默认演示账号（多人共享列表）；"
+            "填写工号或姓名则仅列出本人单据。部署可用环境变量 QUOTATION_OWNER_FALLBACK 修改默认名。"
+        )
+        st.divider()
+
         st.markdown("### 系统配置")
 
         api_key = st.text_input("API Key", value=config.LLM_API_KEY, type="password")
@@ -281,22 +319,13 @@ def render_sidebar():
         craft_lib_path = st.text_input("工艺库路径", value=config.CRAFT_LIBRARY_PATH)
 
         if st.button("构建索引"):
-            if not config.LLM_API_KEY:
-                st.error("请先填入API Key")
-            else:
-                with st.spinner("正在构建..."):
-                    try:
-                        template_only = load_craft_library(craft_lib_path)
-                        craft_items = merge_template_with_saved_user_entries(
-                            template_only, "data"
-                        )
-                        index = build_vector_index(craft_items, "data")
-                        st.success(
-                            f"完成！共 {len(craft_items)} 条（已合并此前「学习入库」条目）"
-                        )
-                        st.rerun()
-                    except Exception:
-                        st.error("构建索引失败，请检查配置后重试。")
+            with st.spinner("正在构建..."):
+                ok, err = run_build_vector_index(craft_lib_path)
+                if ok:
+                    st.success("完成！已写入索引（已合并此前「学习入库」条目）。")
+                    st.rerun()
+                else:
+                    st.error(f"构建索引失败：{err}")
 
         with st.expander("从报价单 Excel 批量学习", expanded=False):
             st.caption(
@@ -331,6 +360,8 @@ def render_sidebar():
                             st.error(f"导入失败: {e}")
 
         with st.expander("高级", expanded=False):
+            st.caption("报价单归档目录（我的报价）")
+            st.code(os.path.normpath(config.QUOTATION_STORE_DIR), language=None)
             st.caption("解析历史存储目录")
             st.code(os.path.normpath(config.ENQUIRY_HISTORY_DIR), language=None)
             if st.checkbox("确认删除全部解析历史（不可恢复）", key="chk_clear_enquiry_history"):
@@ -377,7 +408,7 @@ def run_matching_pipeline(
     """运行智能匹配并写入 session（Excel 在页面确认后由用户手动导出）。"""
 
     if index is None:
-        st.error("向量索引未构建，请先在左侧点击【构建索引】")
+        st.error("向量索引未构建：请展开页面上方「首次部署」或在侧栏点击【构建索引】。")
         st.stop()
 
     match_was_cached = (
@@ -458,7 +489,42 @@ def render_quotation_preview_and_export(active_file_key: str | None):
     )
     st.session_state["quotation_edited_df"] = edited_df
 
-    if st.button("导出 Excel 报价单", type="primary", key=f"export_quotation_{active_file_key}_{rev}"):
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        export_clicked = st.button(
+            "导出 Excel 报价单", type="primary", key=f"export_quotation_{active_file_key}_{rev}"
+        )
+    with ec2:
+        draft_clicked = st.button(
+            "保存草稿到「我的报价」", key=f"save_draft_quotation_{active_file_key}_{rev}"
+        )
+
+    if draft_clicked:
+        owner_d = _effective_quotation_owner()
+        enq_d = st.session_state.get("enquiry_items")
+        merged_d = merge_preview_dataframe_into_match_results(edited_df, results, enq_d)
+        st.session_state["match_results"] = merged_d
+        src_run = (st.session_state.get("from_history_run_id") or "").strip() or None
+        qid_d = st.session_state.get("active_quotation_id")
+        new_id = quotation_store.upsert_quotation(
+            owner=owner_d,
+            enquiry_items=list(enq_d or []),
+            match_results=list(merged_d or []),
+            file_hash=active_file_key or "",
+            original_filename=(st.session_state.get("active_original_filename") or ""),
+            source_run_id=src_run,
+            status="draft",
+            excel_src_path=None,
+            quotation_id=qid_d,
+        )
+        if new_id:
+            st.session_state["active_quotation_id"] = new_id
+            st.success("已保存草稿。")
+            st.rerun()
+        else:
+            st.error("保存失败（例如报价单归属校验未通过）。")
+
+    if export_clicked:
         enq = st.session_state.get("enquiry_items")
         merged = merge_preview_dataframe_into_match_results(edited_df, results, enq)
         st.session_state["match_results"] = merged
@@ -474,7 +540,23 @@ def render_quotation_preview_and_export(active_file_key: str | None):
         st.session_state["excel_name"] = output_name
         st.session_state["quotation_export_revision"] = int(st.session_state.get("results_revision", 0))
         st.session_state["quotation_edited_df"] = match_results_to_preview_dataframe(merged)
-        st.success("已根据当前表格生成 Excel，可下载。")
+        owner_e = _effective_quotation_owner()
+        src_run_e = (st.session_state.get("from_history_run_id") or "").strip() or None
+        qid_e = st.session_state.get("active_quotation_id")
+        new_id_e = quotation_store.upsert_quotation(
+            owner=owner_e,
+            enquiry_items=list(enq or []),
+            match_results=list(merged or []),
+            file_hash=active_file_key or "",
+            original_filename=(st.session_state.get("active_original_filename") or ""),
+            source_run_id=src_run_e,
+            status="ready",
+            excel_src_path=output_path,
+            quotation_id=qid_e,
+        )
+        if new_id_e:
+            st.session_state["active_quotation_id"] = new_id_e
+        st.success("已根据当前表格生成 Excel，可下载；并已归档到「我的报价」（待发送）。")
         st.rerun()
 
     if st.session_state.get("excel_ready") and st.session_state.get("excel_path"):
@@ -762,12 +844,125 @@ def render_self_learning_panel(embedded: bool = False):
                                 st.rerun()
 
 
+def render_my_quotations_tab():
+    """当前报价员的报价单列表：筛选、下载归档 Excel、改状态、载入继续编辑。"""
+    st.subheader("我的报价")
+    owner = _effective_quotation_owner()
+
+    counts = quotation_store.status_counts_for_owner(owner)
+    filter_keys = ["all", *quotation_store.QUOTATION_STATUSES]
+
+    def _flt_label(k: str) -> str:
+        if k == "all":
+            return f"全部 ({counts['all']})"
+        return f"{quotation_store.STATUS_LABELS_CN[k]} ({counts[k]})"
+
+    st.radio(
+        "状态筛选",
+        options=filter_keys,
+        format_func=_flt_label,
+        horizontal=True,
+        key="my_quotations_filter_radio",
+    )
+    status_choice = st.session_state.get("my_quotations_filter_radio") or "all"
+
+    rows = quotation_store.list_quotation_meta_for_owner(owner, status_choice)
+    if not rows:
+        st.caption("暂无符合条件的报价单。完成「上传处理」中的匹配后，可使用「保存草稿」或导出 Excel 归档。")
+        return
+
+    disp = []
+    for r in rows:
+        st_key = r.get("status") or "draft"
+        disp.append(
+            {
+                "报价单ID": r.get("quotation_id", ""),
+                "标题": r.get("display_title", ""),
+                "状态": quotation_store.STATUS_LABELS_CN.get(st_key, st_key),
+                "原文件": r.get("original_filename", ""),
+                "条数": r.get("item_count", 0),
+                "含Excel": "是" if r.get("has_excel") else "否",
+                "更新时间": (r.get("updated_at") or "")[:19].replace("T", " "),
+            }
+        )
+    st.dataframe(pd.DataFrame(disp), use_container_width=True, hide_index=True)
+
+    ids = [r["quotation_id"] for r in rows if r.get("quotation_id")]
+    sid = st.selectbox(
+        "选择报价单进行操作",
+        options=ids,
+        key="my_quotations_selected_id",
+    )
+    if not sid:
+        return
+
+    full = quotation_store.load_quotation(sid)
+    if not full:
+        st.error("记录不存在或已损坏。")
+        return
+
+    ex_path = quotation_store.exported_excel_abs_path(full)
+
+    bc1, bc2, bc3, bc4 = st.columns(4)
+    with bc1:
+        if ex_path:
+            with open(ex_path, "rb") as xf:
+                st.download_button(
+                    label="下载已归档 Excel",
+                    data=xf.read(),
+                    file_name=f"{sid}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"myq_dl_{sid}",
+                )
+        else:
+            st.caption("该单尚无归档 Excel（草稿或尚未导出）。")
+    with bc2:
+        if st.button("载入继续处理", key=f"myq_resume_{sid}"):
+            fh = (full.get("file_hash") or "").strip() or f"quot_{sid}"
+            st.session_state["enquiry_items"] = list(full.get("enquiry_items") or [])
+            st.session_state["match_results"] = list(full.get("match_results") or [])
+            st.session_state["active_file_key"] = fh
+            st.session_state["match_results_file_key"] = fh
+            st.session_state["active_original_filename"] = full.get("original_filename") or ""
+            st.session_state["active_quotation_id"] = sid
+            st.session_state["pipeline_from_my_quotation"] = True
+            st.session_state.pop("from_history_run_id", None)
+            st.session_state.pop("pipeline_from_history", None)
+            st.session_state.pop("quotation_snapshot_run_id", None)
+            for key in (
+                "excel_ready",
+                "excel_path",
+                "excel_name",
+                "quotation_preview_stamp",
+                "quotation_edited_df",
+                "quotation_export_revision",
+            ):
+                st.session_state.pop(key, None)
+            st.success("已载入。请切换到「上传处理」查看进度条、预览表与导出。")
+            st.rerun()
+    with bc3:
+        new_st = st.selectbox(
+            "改为状态",
+            options=list(quotation_store.QUOTATION_STATUSES),
+            format_func=lambda s: quotation_store.STATUS_LABELS_CN[s],
+            key="my_quotations_new_status_value",
+        )
+        if st.button("应用状态", key=f"my_q_apply_status_{sid}"):
+            if quotation_store.set_quotation_status(sid, owner, new_st):
+                st.success("状态已更新。")
+                st.rerun()
+            else:
+                st.error("更新失败。")
+    with bc4:
+        st.caption(f"内部ID：`{sid}`")
+
+
 # 页面配置
 st.set_page_config(
     page_title="万邦船舶询价匹配系统",
     page_icon="🚢",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # === 自定义样式 ===
@@ -778,10 +973,9 @@ st.markdown("""
         background: linear-gradient(135deg, #f0f4f8 0%, #e8eef5 50%, #f5f7fa 100%);
     }
 
-    /* 隐藏默认header和footer */
+    /* 隐藏右上角菜单与页脚；勿隐藏整个 header，否则侧栏收起后无法展开（云上常见） */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    header {visibility: hidden;}
 
     /* 主标题 */
     .main-title {
@@ -1067,10 +1261,30 @@ if config_errors:
 # 初始化 session state
 init_session_state()
 
+if st.session_state.get("index") is None:
+    with st.expander("**首次部署**：找不到侧栏时，请在此构建工艺库索引", expanded=True):
+        st.caption(
+            "云上请在 Streamlit **Settings → Secrets** 配置 **LLM_API_KEY**；"
+            "路径一般为仓库内 **data/craft_template.xlsx**。"
+        )
+        craft_main = st.text_input(
+            "工艺库 Excel 路径",
+            value=config.CRAFT_LIBRARY_PATH,
+            key="craft_path_main_build",
+        )
+        if st.button("在此处构建索引", key="build_idx_main"):
+            with st.spinner("正在构建..."):
+                ok, err = run_build_vector_index(craft_main)
+                if ok:
+                    st.success("索引已生成，页面将刷新。")
+                    st.rerun()
+                else:
+                    st.error(f"构建失败：{err}")
+
 # 侧边栏
 index, craft_items = render_sidebar()
 
-tab_upload, tab_history = st.tabs(["上传处理", "历史解析"])
+tab_upload, tab_my_quotations, tab_history = st.tabs(["上传处理", "我的报价", "历史解析"])
 
 with tab_upload:
     uploaded_file = st.file_uploader(
@@ -1082,6 +1296,8 @@ with tab_upload:
         pass
     elif st.session_state.get("pipeline_from_history"):
         st.info("当前会话已从「历史解析」载入数据，进度与导出见页面下方。")
+    elif st.session_state.get("pipeline_from_my_quotation"):
+        st.info("当前会话已从「我的报价」载入数据，进度与导出见页面下方。")
     else:
         st.markdown(
             """
@@ -1094,6 +1310,9 @@ with tab_upload:
     """,
             unsafe_allow_html=True,
         )
+
+with tab_my_quotations:
+    render_my_quotations_tab()
 
 with tab_history:
     runs = list_runs()
@@ -1119,26 +1338,42 @@ with tab_history:
         rec = load_run(pick) if pick else None
         if rec:
             items = rec.get("enquiry_items") or []
-            if items:
+            snap_mr = rec.get("match_results")
+            if isinstance(snap_mr, list) and snap_mr:
+                st.subheader("报价单（历史快照）")
+                snap_at = (rec.get("match_snapshot_at") or "")[:19].replace("T", " ")
+                if snap_at:
+                    st.caption(f"匹配快照时间：{snap_at} UTC（与当时工艺库一致，仅作查看）")
                 st.dataframe(
-                    pd.DataFrame(items),
+                    match_results_to_preview_dataframe(snap_mr),
                     use_container_width=True,
-                    height=min(480, 120 + 28 * len(items)),
+                    height=min(620, 140 + 32 * len(snap_mr)),
+                    hide_index=True,
                 )
             else:
-                st.warning("该记录无解析条目。")
-            payload = json.dumps(rec, ensure_ascii=False, indent=2).encode("utf-8")
-            st.download_button(
-                label="下载完整 JSON",
-                data=payload,
-                file_name=f"enquiry_run_{rec.get('run_id', 'export')}.json",
-                mime="application/json",
-            )
+                st.info(
+                    "该记录尚无报价单快照（较早的解析记录未保存匹配结果）。"
+                    "点击下方「载入并生成报价单」后，系统会重新匹配并写入快照。"
+                )
+                if items:
+                    st.markdown("##### 解析出的询价条目")
+                    st.dataframe(
+                        pd.DataFrame(items),
+                        use_container_width=True,
+                        height=min(360, 120 + 28 * len(items)),
+                    )
+                else:
+                    st.warning("该记录无解析条目。")
             if st.button("载入并生成报价单", key="history_load_match"):
                 st.session_state["enquiry_items"] = list(items)
                 st.session_state["active_file_key"] = rec.get("file_hash") or ""
+                st.session_state["active_original_filename"] = rec.get("original_filename") or ""
                 st.session_state["pipeline_from_history"] = True
-                st.session_state["from_history_run_id"] = rec.get("run_id") or ""
+                rid_h = (rec.get("run_id") or "").strip()
+                st.session_state["from_history_run_id"] = rid_h
+                st.session_state["quotation_snapshot_run_id"] = rid_h
+                st.session_state.pop("pipeline_from_my_quotation", None)
+                st.session_state.pop("active_quotation_id", None)
                 for key in [
                     "match_results",
                     "match_results_file_key",
@@ -1152,13 +1387,15 @@ with tab_history:
                     st.session_state.pop(key, None)
                 st.rerun()
 
-# --- 统一管线：本地上传 或 历史载入 ---
+# --- 统一管线：本地上传 或 历史载入 或「我的报价」载入 ---
 if uploaded_file:
     st.session_state.pop("from_history_run_id", None)
     st.session_state.pop("pipeline_from_history", None)
+    st.session_state.pop("pipeline_from_my_quotation", None)
 
     file_bytes = uploaded_file.getvalue()
     file_key = hashlib.md5(file_bytes).hexdigest()
+    st.session_state["active_original_filename"] = uploaded_file.name
 
     if st.session_state.get("active_file_key") != file_key:
         st.session_state["active_file_key"] = file_key
@@ -1172,6 +1409,8 @@ if uploaded_file:
             "quotation_preview_stamp",
             "quotation_edited_df",
             "quotation_export_revision",
+            "active_quotation_id",
+            "quotation_snapshot_run_id",
         ]:
             st.session_state.pop(key, None)
 
@@ -1180,12 +1419,24 @@ elif st.session_state.get("pipeline_from_history"):
     if not file_key:
         st.error("历史记录缺少 file_hash，无法继续匹配。")
         st.stop()
+elif st.session_state.get("pipeline_from_my_quotation"):
+    file_key = st.session_state.get("active_file_key") or ""
+    if not file_key:
+        st.error("报价单缺少 file_hash，无法继续匹配。")
+        st.stop()
 else:
     file_key = None
 
-if uploaded_file or st.session_state.get("pipeline_from_history"):
+if (
+    uploaded_file
+    or st.session_state.get("pipeline_from_history")
+    or st.session_state.get("pipeline_from_my_quotation")
+):
     if st.session_state.get("from_history_run_id") and not uploaded_file:
         st.caption(f"当前数据来源：历史记录 `{st.session_state['from_history_run_id']}`")
+    elif st.session_state.get("pipeline_from_my_quotation") and not uploaded_file:
+        qid_cap = st.session_state.get("active_quotation_id") or ""
+        st.caption(f"当前数据来源：我的报价 `{qid_cap}`")
 
     progress_bar = st.progress(0.0, text="准备处理…")
     caption_el = st.empty()
@@ -1209,7 +1460,8 @@ if uploaded_file or st.session_state.get("pipeline_from_history"):
                 )
                 st.session_state["enquiry_items"] = enquiry_items
                 try:
-                    append_run(uploaded_file.name, file_key, enquiry_items)
+                    rid_new = append_run(uploaded_file.name, file_key, enquiry_items)
+                    st.session_state["quotation_snapshot_run_id"] = rid_new
                 except Exception:
                     st.caption("（解析历史写入失败，可检查目录权限）")
                 try:
@@ -1234,12 +1486,24 @@ if uploaded_file or st.session_state.get("pipeline_from_history"):
             jp.skip_to_after_parse()
         run_matching_pipeline(enquiry_items, index, craft_items, file_key, jp)
 
+    snap_rid = (st.session_state.get("quotation_snapshot_run_id") or "").strip()
+    snap_mr = st.session_state.get("match_results")
+    if snap_rid and isinstance(snap_mr, list) and snap_mr:
+        try:
+            save_run_match_snapshot(snap_rid, snap_mr)
+        except Exception:
+            pass
+
     render_quotation_pipeline_stepper(file_key)
     render_quotation_preview_and_export(file_key)
 
-n_learn = count_self_learning_eligible_rows()
-_learn_title = "工艺库自主学习（可选）"
-if n_learn:
-    _learn_title += f" — 本单有 {n_learn} 条可关注"
-with st.expander(_learn_title, expanded=False):
-    render_self_learning_panel(embedded=True)
+if (
+    st.session_state.get("match_results") is not None
+    and st.session_state.get("enquiry_items") is not None
+):
+    n_learn = count_self_learning_eligible_rows()
+    _learn_title = "工艺库自主学习（可选）"
+    if n_learn:
+        _learn_title += f" — 本单有 {n_learn} 条可关注"
+    with st.expander(_learn_title, expanded=False):
+        render_self_learning_panel(embedded=True)
