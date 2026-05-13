@@ -16,6 +16,27 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import streamlit as st
 
+
+def _apply_streamlit_secrets_to_environ() -> None:
+    """Streamlit Community Cloud：Secrets 仅在 st.secrets；须在首次 import config 前写入 os.environ。"""
+    try:
+        sec = st.secrets
+    except Exception:
+        return
+    try:
+        for key in sec:
+            val = sec[key]
+            if not isinstance(val, (str, int, float, bool)):
+                continue
+            name = str(key)
+            if name not in os.environ or os.environ.get(name, "") == "":
+                os.environ[name] = str(val)
+    except Exception:
+        return
+
+
+_apply_streamlit_secrets_to_environ()
+
 from app.document_parser import parse_document
 from app.craft_library import (
     add_to_library,
@@ -950,6 +971,83 @@ st.markdown("""
         background: #f5f7fa;
         border-radius: 8px;
     }
+
+    /* 主流程五步 Stepper（与帆软式里程碑条类似） */
+    .pipeline-stepper {
+        background: #ffffff;
+        border: 1px solid #e0e7ee;
+        border-radius: 12px;
+        padding: 0.75rem 1rem 1rem 1rem;
+        margin: 0.5rem 0 1rem 0;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+    }
+    .pipeline-stepper .ps-row {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        width: 100%;
+        flex-wrap: nowrap;
+        gap: 0;
+    }
+    .pipeline-stepper .ps-node {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        flex: 0 1 120px;
+        min-width: 0;
+        text-align: center;
+    }
+    .pipeline-stepper .ps-circle {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.85rem;
+        font-weight: 700;
+        flex-shrink: 0;
+    }
+    .pipeline-stepper .ps-done {
+        background: #90CAF9;
+        color: #ffffff;
+    }
+    .pipeline-stepper .ps-current {
+        background: #1976D2;
+        color: #ffffff;
+    }
+    .pipeline-stepper .ps-wait {
+        background: #ECEFF1;
+        color: #90A4AE;
+        border: 1px solid #CFD8DC;
+    }
+    .pipeline-stepper .ps-title {
+        margin-top: 6px;
+        font-size: 0.78rem;
+        line-height: 1.25;
+        word-break: break-all;
+    }
+    .pipeline-stepper .ps-title-done,
+    .pipeline-stepper .ps-title-current {
+        color: #263238;
+    }
+    .pipeline-stepper .ps-title-current {
+        font-weight: 700;
+    }
+    .pipeline-stepper .ps-title-wait {
+        color: #B0BEC5;
+    }
+    .pipeline-stepper .ps-line {
+        flex: 1 1 12px;
+        height: 2px;
+        margin-top: 15px;
+        min-width: 6px;
+        background: #E0E7EE;
+        align-self: flex-start;
+    }
+    .pipeline-stepper .ps-line-done {
+        background: #90CAF9;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1136,6 +1234,12 @@ if uploaded_file or st.session_state.get("pipeline_from_history"):
             jp.skip_to_after_parse()
         run_matching_pipeline(enquiry_items, index, craft_items, file_key, jp)
 
+    render_quotation_pipeline_stepper(file_key)
     render_quotation_preview_and_export(file_key)
 
-render_self_learning_panel()
+n_learn = count_self_learning_eligible_rows()
+_learn_title = "工艺库自主学习（可选）"
+if n_learn:
+    _learn_title += f" — 本单有 {n_learn} 条可关注"
+with st.expander(_learn_title, expanded=False):
+    render_self_learning_panel(embedded=True)
